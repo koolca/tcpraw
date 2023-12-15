@@ -66,9 +66,13 @@ type TCPConn struct {
 	// iptables
 	iptables *iptables.IPTables
 	iprule   []string
+	iptables2 *iptables.IPTables
+	iprule2   []string
 
 	ip6tables *iptables.IPTables
 	ip6rule   []string
+	ip6tables2 *iptables.IPTables
+	ip6rule2   []string
 
 	// deadlines
 	readDeadline  atomic.Value
@@ -308,8 +312,14 @@ func (conn *TCPConn) Close() error {
 		if conn.iptables != nil {
 			conn.iptables.Delete("filter", "OUTPUT", conn.iprule...)
 		}
+		if conn.iptables2 != nil {
+			conn.iptables2.Delete("filter", "OUTPUT", conn.iprule2...)
+		}
 		if conn.ip6tables != nil {
 			conn.ip6tables.Delete("filter", "OUTPUT", conn.ip6rule...)
+		}
+		if conn.ip6tables2 != nil {
+			conn.ip6tables2.Delete("filter", "OUTPUT", conn.ip6rule2...)
 		}
 	})
 	return err
@@ -433,6 +443,15 @@ func Dial(network, address string) (*TCPConn, error) {
 				}
 			}
 		}
+		rule2 := []string{"--tcp-flags", "RST", "RST", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule2...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule2...); err == nil {
+					conn.iprule2 = rule2
+					conn.iptables2 = ipt
+				}
+			}
+		}
 	}
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
@@ -441,6 +460,15 @@ func Dial(network, address string) (*TCPConn, error) {
 				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
 					conn.ip6rule = rule
 					conn.ip6tables = ipt
+				}
+			}
+		}
+		rule2 := []string{"--tcp-flags", "RST", "RST", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule2...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule2...); err == nil {
+					conn.ip6rule2 = rule2
+					conn.ip6tables2 = ipt
 				}
 			}
 		}
@@ -529,6 +557,15 @@ func Listen(network, address string) (*TCPConn, error) {
 				}
 			}
 		}
+		rule2 := []string{"--tcp-flags", "RST", "RST", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule2...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule2...); err == nil {
+					conn.iprule2 = rule2
+					conn.iptables2 = ipt
+				}
+			}
+		}
 	}
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
@@ -537,6 +574,15 @@ func Listen(network, address string) (*TCPConn, error) {
 				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
 					conn.ip6rule = rule
 					conn.ip6tables = ipt
+				}
+			}
+		}
+		rule2 := []string{"--tcp-flags", "RST", "RST", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule2...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule2...); err == nil {
+					conn.ip6rule2 = rule2
+					conn.ip6tables2 = ipt
 				}
 			}
 		}
