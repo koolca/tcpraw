@@ -37,6 +37,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
+    "os"
+    "os/signal"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/gopacket"
@@ -100,10 +103,10 @@ type tcpConn struct {
 	flowsLock sync.Mutex
 
 	// iptables
-	iptables  *iptables.IPTables // Handle for IPv4 iptables rules
-	iprule    []string           // IPv4 iptables rule associated with the connection
-	ip6tables *iptables.IPTables // Handle for IPv6 iptables rules
-	ip6rule   []string           // IPv6 iptables rule associated with the connection
+    iptables  *iptables.IPTables // Handle for IPv4 iptables rules
+    iprules   [][]string         // Changed: Support multiple IPv4 rules (TTL + RST)
+    ip6tables *iptables.IPTables // Handle for IPv6 iptables rules
+    ip6rules  [][]string         // Changed: Support multiple IPv6 rules
 
 	// deadlines
 	readDeadline  atomic.Value // Atomic value for read deadline
@@ -180,7 +183,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			continue
 		}
 
-		// port filtering
+		// port filtering (Double check in userspace, though BPF should have filtered it)
 		if int(tcp.DstPort) != port {
 			continue
 		}
@@ -371,12 +374,16 @@ func (conn *tcpConn) Close() error {
 			conn.handles[k].Close()
 		}
 
-		// delete iptable
+		// delete iptable (Loop through all rules)
 		if conn.iptables != nil {
-			conn.iptables.Delete("filter", "OUTPUT", conn.iprule...)
+			for _, rule := range conn.iprules {
+				conn.iptables.Delete("filter", "OUTPUT", rule...)
+			}
 		}
 		if conn.ip6tables != nil {
-			conn.ip6tables.Delete("filter", "OUTPUT", conn.ip6rule...)
+			for _, rule := range conn.ip6rules {
+				conn.ip6tables.Delete("filter", "OUTPUT", rule...)
+			}
 		}
 
 		// remove from the global list
@@ -474,12 +481,6 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	// parse local ip and port from tcpconn
-	laddr, lport, err := net.SplitHostPort(tcpconn.LocalAddr().String())
-	if err != nil {
-		return nil, err
-	}
-
 	// fields
 	conn := new(tcpConn)
 	conn.die = make(chan struct{})
@@ -494,7 +495,17 @@ func Dial(network, address string) (*TCPConn, error) {
 	}
 	conn.tcpFingerPrint = fingerPrintLinux.Clone()
 
-	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
+	// Apply BPF filter to only receive packets for this connection's port
+	// This prevents the "thundering herd" problem where multiple processes
+	// receive all packets, causing high CPU usage on idle processes.
+	// Note: We use the local port of the established TCP connection.
+	lportInt := tcpconn.LocalAddr().(*net.TCPAddr).Port
+	if err := applyBPF(handle, lportInt); err != nil {
+		// Log error but don't fail, fallback to userspace filtering
+		// fmt.Println("Warning: failed to apply BPF filter:", err)
+	}
+
+	go conn.captureFlow(handle, lportInt)
 	go conn.cleaner()
 
 	// iptables
@@ -506,23 +517,54 @@ func Dial(network, address string) (*TCPConn, error) {
 
 	// setup iptables only when it's the first connection
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
-		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+		// Rule 1: Drop TTL=1 (Kernel ACKs)
+		ttlRule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		// Rule 2: Drop RST packets (Prevents Connection Reset by Kernel)
+		rstRule := []string{"-p", "tcp", "--tcp-flags", "RST", "RST", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+
+		conn.iptables = ipt
+
+        //_ = ipt.Delete("filter", "OUTPUT", rstRule...)
+		//_ = ipt.Delete("filter", "OUTPUT", ttlRule...)
+
+		// Insert RST Rule at position 1
+		if exists, err := ipt.Exists("filter", "OUTPUT", rstRule...); err == nil {
 			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.iprule = rule
-					conn.iptables = ipt
+				// use Insert(..., 1, ...) to prepend
+				if err = ipt.Insert("filter", "OUTPUT", 1, rstRule...); err == nil {
+					conn.iprules = append(conn.iprules, rstRule)
+				}
+			}
+		}
+
+		// Insert TTL Rule at position 1 (pushes RST to 2, both are at top)
+		if exists, err := ipt.Exists("filter", "OUTPUT", ttlRule...); err == nil {
+			if !exists {
+				if err = ipt.Insert("filter", "OUTPUT", 1, ttlRule...); err == nil {
+					conn.iprules = append(conn.iprules, ttlRule)
 				}
 			}
 		}
 	}
+
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
-		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+		// IPv6 Rules
+		ttlRule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		rstRule := []string{"-p", "tcp", "--tcp-flags", "RST", "RST", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+
+		conn.ip6tables = ipt
+
+		if exists, err := ipt.Exists("filter", "OUTPUT", rstRule...); err == nil {
 			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.ip6rule = rule
-					conn.ip6tables = ipt
+				if err = ipt.Insert("filter", "OUTPUT", 1, rstRule...); err == nil {
+					conn.ip6rules = append(conn.ip6rules, rstRule)
+				}
+			}
+		}
+		if exists, err := ipt.Exists("filter", "OUTPUT", ttlRule...); err == nil {
+			if !exists {
+				if err = ipt.Insert("filter", "OUTPUT", 1, ttlRule...); err == nil {
+					conn.ip6rules = append(conn.ip6rules, ttlRule)
 				}
 			}
 		}
@@ -573,6 +615,10 @@ func Listen(network, address string) (*TCPConn, error) {
 					if ipaddr, ok := addr.(*net.IPNet); ok {
 						if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: ipaddr.IP}); err == nil {
 							conn.handles = append(conn.handles, handle)
+							// Apply BPF
+							if err := applyBPF(handle, laddr.Port); err != nil {
+								// Log or ignore
+							}
 							go conn.captureFlow(handle, laddr.Port)
 						} else {
 							lasterr = err
@@ -587,6 +633,10 @@ func Listen(network, address string) (*TCPConn, error) {
 	} else {
 		if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: laddr.IP}); err == nil {
 			conn.handles = append(conn.handles, handle)
+			// Apply BPF
+			if err := applyBPF(handle, laddr.Port); err != nil {
+				// Log or ignore
+			}
 			go conn.captureFlow(handle, laddr.Port)
 		} else {
 			return nil, err
@@ -607,28 +657,73 @@ func Listen(network, address string) (*TCPConn, error) {
 	// start cleaner
 	go conn.cleaner()
 
-	// iptables drop packets marked with TTL = 1
-	// TODO: what if iptables is not available, the next hop will send back ICMP Time Exceeded,
-	// is this still an acceptable behavior?
+	// ---------------------------------------------------------------------
+	// Helper：检查是否为 IPv6 通配符地址 (::)
+	// ---------------------------------------------------------------------
+	isIPv6Wildcard := func(addr *net.TCPAddr) bool {
+		if addr.IP.To4() != nil {
+			return false
+		}
+		for _, b := range addr.IP {
+			if b != 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	// 1. 设置 IPv4 规则 (使用 Insert + RST)
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
-		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.iprule = rule
-					conn.iptables = ipt
-				}
+		var srcIP string
+		// 如果监听 [::]，在 IPv4 iptables 中必须视为 0.0.0.0/0
+		if isIPv6Wildcard(laddr) {
+			srcIP = "0.0.0.0/0"
+		} else if ip4 := laddr.IP.To4(); ip4 != nil {
+			srcIP = ip4.String()
+		} else {
+			// 纯 IPv6 非通配符地址，通常不匹配 IPv4，但也设为通配以防万一
+			srcIP = "0.0.0.0/0"
+		}
+
+		// TTL Rule
+		ttlRule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", srcIP, "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+		// RST Rule
+		rstRule := []string{"-p", "tcp", "--tcp-flags", "RST", "RST", "-s", srcIP, "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+
+		conn.iptables = ipt
+
+        //_ = ipt.Delete("filter", "OUTPUT", rstRule...)
+		//_ = ipt.Delete("filter", "OUTPUT", ttlRule...)
+
+		// 插入 RST 规则
+		if exists, err := ipt.Exists("filter", "OUTPUT", rstRule...); err == nil && !exists {
+			if err = ipt.Insert("filter", "OUTPUT", 1, rstRule...); err == nil {
+				conn.iprules = append(conn.iprules, rstRule)
+			}
+		}
+		// 插入 TTL 规则
+		if exists, err := ipt.Exists("filter", "OUTPUT", ttlRule...); err == nil && !exists {
+			if err = ipt.Insert("filter", "OUTPUT", 1, ttlRule...); err == nil {
+				conn.iprules = append(conn.iprules, ttlRule)
 			}
 		}
 	}
+
+	// 2. 设置 IPv6 规则
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
-		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.ip6rule = rule
-					conn.ip6tables = ipt
-				}
+		ttlRule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+		rstRule := []string{"-p", "tcp", "--tcp-flags", "RST", "RST", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
+
+		conn.ip6tables = ipt
+
+		if exists, err := ipt.Exists("filter", "OUTPUT", rstRule...); err == nil && !exists {
+			if err = ipt.Insert("filter", "OUTPUT", 1, rstRule...); err == nil {
+				conn.ip6rules = append(conn.ip6rules, rstRule)
+			}
+		}
+		if exists, err := ipt.Exists("filter", "OUTPUT", ttlRule...); err == nil && !exists {
+			if err = ipt.Insert("filter", "OUTPUT", 1, ttlRule...); err == nil {
+				conn.ip6rules = append(conn.ip6rules, ttlRule)
 			}
 		}
 	}
@@ -711,4 +806,147 @@ func wrapConn(conn *tcpConn) *TCPConn {
 	})
 
 	return wrapper
+}
+
+// applyBPF attaches a specific BPF filter based on the IP family of the socket.
+// This eliminates the ambiguity of "Hybrid" filters.
+// - For IPv4 Sockets: Uses dynamic IHL calculation to find TCP port (Handles Options).
+// - For IPv6 Sockets: Uses direct offset lookup (Raw TCP payload).
+func applyBPF(conn *net.IPConn, port int) error {
+	f, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	// 1. Determine IP Family from the local address
+	addr := conn.LocalAddr().(*net.IPAddr)
+	isIPv4 := addr.IP.To4() != nil
+	targetPort := uint32(port)
+
+	var filter []syscall.SockFilter
+
+	if isIPv4 {
+		// ---------------------------------------------------------
+		// IPv4 ONLY Filter
+		// Robust logic: Calculates IHL to skip IP header (handles Options)
+		// ---------------------------------------------------------
+		filter = []syscall.SockFilter{
+			// 1. Load IP Header Length (IHL) * 4 into Register X
+			//    Instruction: ldxb 4*([0]&0xf)
+			//    This reads the first byte, masks low 4 bits, multiplies by 4.
+			{Code: syscall.BPF_LDX | syscall.BPF_B | syscall.BPF_MSH, K: 0},
+
+			// 2. Load 16-bit Destination Port at (Register X + 2)
+			//    X is the length of IP header. X+2 is where DstPort sits in TCP header.
+			{Code: syscall.BPF_LD | syscall.BPF_H | syscall.BPF_IND, K: 2},
+
+			// 3. Compare with Target Port
+			//    If Equal -> Jump to KEEP (Line 5). Else -> Fallthrough to DROP.
+			{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, K: targetPort, Jt: 1, Jf: 0},
+
+			// 4. DROP
+			{Code: syscall.BPF_RET | syscall.BPF_K, K: 0},
+
+			// 5. KEEP
+			{Code: syscall.BPF_RET | syscall.BPF_K, K: 0xFFFFFFFF},
+		}
+	} else {
+		// ---------------------------------------------------------
+		// IPv6 ONLY Filter
+		// Logic: AF_INET6 SOCK_RAW (IPPROTO_TCP) strips IPv6 header.
+		// Data starts directly at TCP Header. DstPort is at Offset 2.
+		// ---------------------------------------------------------
+		filter = []syscall.SockFilter{
+			// 1. Load 16-bit Destination Port at Offset 2
+			{Code: syscall.BPF_LD | syscall.BPF_H | syscall.BPF_ABS, K: 2},
+
+			// 2. Compare with Target Port
+			//    If Equal -> Jump to KEEP (Line 4). Else -> Fallthrough to DROP.
+			{Code: syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K, K: targetPort, Jt: 1, Jf: 0},
+
+			// 3. DROP
+			{Code: syscall.BPF_RET | syscall.BPF_K, K: 0},
+
+			// 4. KEEP
+			{Code: syscall.BPF_RET | syscall.BPF_K, K: 0xFFFFFFFF},
+		}
+	}
+
+	var sockErr error
+	err = f.Control(func(fd uintptr) {
+		prog := syscall.SockFprog{
+			Len:    uint16(len(filter)),
+			Filter: (*syscall.SockFilter)(unsafe.Pointer(&filter[0])),
+		}
+
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			uintptr(fd),
+			uintptr(syscall.SOL_SOCKET),
+			uintptr(syscall.SO_ATTACH_FILTER),
+			uintptr(unsafe.Pointer(&prog)),
+			uintptr(unsafe.Sizeof(prog)),
+			0,
+		)
+		if errno != 0 {
+			sockErr = errno
+		}
+	})
+
+	if err != nil {
+		return err
+	}
+	if sockErr != nil {
+		fmt.Printf("Warning: BPF Attach Failed: %v\n", sockErr)
+	}
+	return sockErr
+}
+
+// ---------------------------------------------------------------------
+// Global Signal Handler for Graceful Shutdown
+// ---------------------------------------------------------------------
+func init() {
+	// 启动一个协程监听系统信号
+	go func() {
+		// 创建一个接收信号的通道
+		c := make(chan os.Signal, 1)
+
+		// 监听 SIGINT (Ctrl+C) 和 SIGTERM (kill 默认信号)
+		// 注意：SIGKILL (kill -9) 是无法捕获的
+		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+
+		// 阻塞直到收到信号
+		<-c
+		//sig := <-c
+		//fmt.Printf("\nReceived signal: %s. Cleaning up iptables rules...\n", sig)
+
+		cleanupAll()
+
+		// 退出程序
+		os.Exit(0)
+	}()
+}
+
+// cleanupAll 安全地关闭所有活跃连接并清理 iptables
+func cleanupAll() {
+	// 1. 获取所有连接的快照
+	// 我们必须先复制一份，因为 conn.Close() 会尝试获取锁并从列表中删除元素，
+	// 如果直接在持有锁的情况下遍历并 Close，会导致死锁。
+	var conns []*tcpConn
+
+	connListMu.Lock()
+	for e := connList.Front(); e != nil; e = e.Next() {
+		if c, ok := e.Value.(*tcpConn); ok {
+			conns = append(conns, c)
+		}
+	}
+	connListMu.Unlock()
+
+	// 2. 逐个关闭
+	for _, c := range conns {
+		// Close 内部会调用 iptables.Delete 清理规则
+		c.Close()
+	}
+
+	//fmt.Printf("Cleaned up %d connections.\n", len(conns))
 }
